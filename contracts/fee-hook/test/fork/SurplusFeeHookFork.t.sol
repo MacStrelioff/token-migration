@@ -36,7 +36,7 @@ abstract contract SurplusFeeHookForkSuite is ForkHarness {
         _swapAndCheck(_exactOutSell(1 ether));
     }
 
-    function test_TreasuryWithdrawsBothHalvesOfEveryFeeCurrency() public {
+    function test_TreasuryWithdrawsFullFeesOfEveryFeeCurrency() public {
         _swapAndCheck(_exactInBuy(1 ether));
         _swapAndCheck(_exactInSell(25_000 ether));
         _swapAndCheck(_exactOutBuy(25_000 ether));
@@ -46,10 +46,9 @@ abstract contract SurplusFeeHookForkSuite is ForkHarness {
         for (uint256 i; i < currencies.length; ++i) {
             IERC20 c = IERC20(currencies[i]);
             uint256 team = hook.teamOwed(address(c));
-            uint256 buyback = hook.buybackOwed(address(c));
             uint256 held = c.balanceOf(address(hook));
             assertGt(team, 0, "fees accrued in both currencies");
-            assertEq(team + buyback, held, "the hook holds exactly the owed fees");
+            assertEq(team, held, "the hook holds exactly the full treasury fees");
             assertEq(hook.totalTaken(address(c)), held, "and exactly what it took");
 
             vm.prank(STRANGER);
@@ -57,16 +56,12 @@ abstract contract SurplusFeeHookForkSuite is ForkHarness {
             hook.withdrawTeam(address(c), STRANGER, team);
 
             uint256 teamSinkBefore = c.balanceOf(TEAM_SINK);
-            uint256 buybackSinkBefore = c.balanceOf(BUYBACK_SINK);
             vm.startPrank(TREASURY);
             hook.withdrawTeam(address(c), TEAM_SINK, team);
-            hook.withdrawBuyback(address(c), BUYBACK_SINK, buyback);
             vm.stopPrank();
-            assertEq(c.balanceOf(TEAM_SINK) - teamSinkBefore, team, "team half paid out");
-            assertEq(c.balanceOf(BUYBACK_SINK) - buybackSinkBefore, buyback, "buyback half paid out");
+            assertEq(c.balanceOf(TEAM_SINK) - teamSinkBefore, team, "full treasury fees paid out");
             assertEq(c.balanceOf(address(hook)), 0, "hook emptied");
-            assertEq(hook.teamPaid(address(c)), team, "team half booked as paid");
-            assertEq(hook.buybackPaid(address(c)), buyback, "buyback half booked as paid");
+            assertEq(hook.teamPaid(address(c)), team, "full treasury fees booked as paid");
         }
     }
 

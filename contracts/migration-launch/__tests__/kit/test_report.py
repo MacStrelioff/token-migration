@@ -81,6 +81,15 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("full range", text)
         self.assertNotIn("No extra single-sided liquidity", text)
 
+    def test_report_describes_full_fee_treasury_withdrawal(self):
+        text = self.render_report()
+        fee_check = text.split("## Fee check", 1)[1].split("## Rival venues", 1)[0]
+        self.assertIn("withdrew the full fees in both currencies from the single treasury bucket", fee_check)
+        self.assertIn("leaving the hook empty", fee_check)
+        self.assertNotIn("team", fee_check.lower())
+        self.assertNotIn("buyback", fee_check.lower())
+        self.assertNotIn("both halves", fee_check.lower())
+
     def test_report_preserves_current_policy_without_guaranteeing_exit_value(self):
         text = self.render_report()
         self.assertNotIn("every migrator keeps its value", text)

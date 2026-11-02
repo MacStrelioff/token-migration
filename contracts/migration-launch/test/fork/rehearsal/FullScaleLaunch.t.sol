@@ -424,15 +424,12 @@ contract FullScaleLaunchRehearsal is Test, IUnlockCallback {
         for (uint256 i; i < 2; ++i) {
             address c = currencies[i];
             uint256 team = hook.teamOwed(c) - hook.teamPaid(c);
-            uint256 buyback = hook.buybackOwed(c) - hook.buybackPaid(c);
             uint256 before = IERC20(c).balanceOf(address(safe));
             (bool a,) =
                 _safeCall(address(hook), abi.encodeCall(SurplusFeeHook.withdrawTeam, (c, address(safe), team)), 0, 2);
-            (bool b,) = _safeCall(
-                address(hook), abi.encodeCall(SurplusFeeHook.withdrawBuyback, (c, address(safe), buyback)), 0, 2
-            );
-            require(a && b, "fee withdrawal");
-            require(IERC20(c).balanceOf(address(safe)) - before == team + buyback, "the Safe received both halves");
+            require(a, "fee withdrawal");
+            require(IERC20(c).balanceOf(address(safe)) - before == team, "the Safe received the full fee");
+            require(hook.teamPaid(c) == hook.teamOwed(c), "treasury fees not booked as paid");
             require(IERC20(c).balanceOf(address(hook)) == 0, "fees left in the hook");
         }
     }

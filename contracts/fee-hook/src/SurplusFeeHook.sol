@@ -5,7 +5,7 @@ import {BalanceDeltaLib, HookFlags, PoolKey, SwapParams, IPoolManager as IManage
 
 /// @notice Successor-pool swap fee hook for exactly one pool: the official key fixed at deployment.
 ///         Charges 1.5% of each swap's unspecified-currency amount (the output of an exact-input swap, the
-///         input of an exact-output swap), split 0.75% to the team treasury and 0.75% to buybacks.
+///         input of an exact-output swap), all accrued to the team treasury in one fee bucket.
 ///         The pool's own LP fee is untouched (pool keyed with a static 0.30% LP fee, 3000 pips):
 ///         the hook fee is a pure add-on on top of pool math.
 /// @dev    Every launch parameter is an immutable, so it lives in the runtime code: whatever reads or places
@@ -22,7 +22,6 @@ contract SurplusFeeHook {
         HookFlags.BEFORE_INITIALIZE | HookFlags.AFTER_SWAP | HookFlags.AFTER_SWAP_RETURNS_DELTA; // 0x2044
     // v4 pip convention (LPFeeLibrary): 1,000,000 pips = 100%. 1.5% = 15,000 pips.
     uint24 public constant FEE_PIPS = 15_000; // 1.50% total swap fee
-    uint24 public constant HALF_PIPS = 7_500; // 0.75% team + 0.75% buyback
     uint256 public constant PIPS_DENOMINATOR = 1_000_000;
 
     address public immutable POOL_MANAGER;
@@ -37,9 +36,7 @@ contract SurplusFeeHook {
     int24 public immutable TICK_SPACING;
 
     mapping(address currency => uint256) public teamOwed;
-    mapping(address currency => uint256) public buybackOwed;
     mapping(address currency => uint256) public teamPaid;
-    mapping(address currency => uint256) public buybackPaid;
     mapping(address currency => uint256) public totalTaken;
 
     error InvalidHookAddress(address hook);
@@ -53,11 +50,8 @@ contract SurplusFeeHook {
     error TransferFailed();
     error NothingToRecover(address currency);
 
-    event FeeTaken(
-        address indexed currency, uint256 unspecifiedAmount, uint256 totalTake, uint256 teamTake, uint256 buybackTake
-    );
+    event FeeTaken(address indexed currency, uint256 basis, uint256 take);
     event TeamWithdrawn(address indexed currency, address indexed to, uint256 amount);
-    event BuybackWithdrawn(address indexed currency, address indexed to, uint256 amount);
     event ExcessRecovered(address indexed currency, address indexed to, uint256 amount);
 
     constructor(
@@ -120,21 +114,19 @@ contract SurplusFeeHook {
         uint256 basis = uint256(unspecified < 0 ? -int256(unspecified) : int256(unspecified));
         uint256 take = (basis * FEE_PIPS) / PIPS_DENOMINATOR;
         if (take == 0) return (this.afterSwap.selector, 0);
-        uint256 half = take / 2; // team gets the floor half, buyback the rest (the odd wei): they sum to take
-        teamOwed[feeCurrency] += half;
-        buybackOwed[feeCurrency] += take - half;
+        teamOwed[feeCurrency] += take;
         totalTaken[feeCurrency] += take;
         // Collect in the same call: the returned +take is a credit to the hook that must be taken before the
         // unlock ends, or the unlock reverts CurrencyNotSettled. take() needs no sync(); a currency left
         // synced would make any native settle{value:} later in the unlock revert NonzeroNativeValue.
         IManager(POOL_MANAGER).take(feeCurrency, address(this), take);
-        emit FeeTaken(feeCurrency, basis, take, half, take - half);
+        emit FeeTaken(feeCurrency, basis, take);
         // take < basis <= 2^127, so it fits in int128.
         // forge-lint: disable-next-line(unsafe-typecast)
         return (this.afterSwap.selector, int128(uint128(take)));
     }
 
-    /// @notice Pays out up to the unpaid team half of `currency`'s fees. Treasury (Safe) only; the Safe picks `to`.
+    /// @notice Pays out up to all unpaid treasury fees in `currency`. Treasury (Safe) only; the Safe picks `to`.
     function withdrawTeam(address currency, address to, uint256 amount) external {
         if (msg.sender != TREASURY) revert NotTreasury(msg.sender);
         uint256 owed = teamOwed[currency] - teamPaid[currency];
@@ -144,23 +136,12 @@ contract SurplusFeeHook {
         emit TeamWithdrawn(currency, to, amount);
     }
 
-    /// @notice Pays out up to the unpaid buyback half of `currency`'s fees. Treasury (Safe) only; how the buyback
-    ///         is executed is Safe policy, not encoded here.
-    function withdrawBuyback(address currency, address to, uint256 amount) external {
-        if (msg.sender != TREASURY) revert NotTreasury(msg.sender);
-        uint256 owed = buybackOwed[currency] - buybackPaid[currency];
-        if (amount > owed) revert InsufficientOwed(currency, owed, amount);
-        buybackPaid[currency] += amount;
-        _transfer(currency, to, amount);
-        emit BuybackWithdrawn(currency, to, amount);
-    }
-
     /// @notice Returns tokens sent to the hook outside a swap (a mistaken transfer, dust): the balance above the
     ///         fees still owed. Treasury (Safe) only; the Safe returns it to the sender. No owed fee can leave
     ///         this way.
     function recoverExcess(address currency, address to) external {
         if (msg.sender != TREASURY) revert NotTreasury(msg.sender);
-        uint256 unpaid = (teamOwed[currency] - teamPaid[currency]) + (buybackOwed[currency] - buybackPaid[currency]);
+        uint256 unpaid = teamOwed[currency] - teamPaid[currency];
         (bool ok, bytes memory ret) = currency.staticcall(abi.encodeWithSignature("balanceOf(address)", address(this)));
         uint256 balance = ok && ret.length >= 32 ? abi.decode(ret, (uint256)) : 0;
         if (balance <= unpaid) revert NothingToRecover(currency);

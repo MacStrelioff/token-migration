@@ -147,13 +147,13 @@ contract RealHookLaunchForkTest is LaunchForkBase, IUnlockCallback {
         address[2] memory currencies = [WETH, address(v2)];
         for (uint256 i; i < 2; ++i) {
             address c = currencies[i];
-            uint256 team = hook.teamOwed(c);
-            uint256 buyback = hook.buybackOwed(c);
-            assertTrue(team != 0 && buyback != 0, "both halves accrued");
+            uint256 team = hook.teamOwed(c) - hook.teamPaid(c);
+            assertTrue(team != 0, "treasury fees accrued");
+            assertEq(team, hook.totalTaken(c), "the full fee accrued to treasury");
             uint256 before = IERC20(c).balanceOf(address(safe));
             _safeExec(address(hook), abi.encodeCall(SurplusFeeHook.withdrawTeam, (c, address(safe), team)));
-            _safeExec(address(hook), abi.encodeCall(SurplusFeeHook.withdrawBuyback, (c, address(safe), buyback)));
-            assertEq(IERC20(c).balanceOf(address(safe)) - before, team + buyback, "the Safe received both halves");
+            assertEq(IERC20(c).balanceOf(address(safe)) - before, team, "the Safe received the full fee");
+            assertEq(hook.teamPaid(c), hook.teamOwed(c), "all treasury fees booked as paid");
             assertEq(IERC20(c).balanceOf(address(hook)), 0, "no fee left in the hook");
         }
     }

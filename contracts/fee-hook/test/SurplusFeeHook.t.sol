@@ -8,6 +8,17 @@ import {FlakyToken} from "./utils/FlakyToken.sol";
 import {MockPoolManager} from "./utils/MockPoolManager.sol";
 import {MockERC20} from "./MockERC20.sol";
 
+interface VmFeeLogs {
+    struct Log {
+        bytes32[] topics;
+        bytes data;
+        address emitter;
+    }
+
+    function recordLogs() external;
+    function getRecordedLogs() external returns (Log[] memory);
+}
+
 /// @dev Unit suite against a mock PoolManager. The real-manager behaviour lives in test/fork/.
 contract SurplusFeeHookTest is HookTest {
     // Spec values, restated independently of the contract's constants.
@@ -21,8 +32,7 @@ contract SurplusFeeHookTest is HookTest {
     address internal constant STRANGER = address(0xBAD);
     address internal constant SWAPPER = address(0x5A1);
     address internal constant TEAM_SINK = address(0x7EA7);
-    address internal constant BUYBACK_SINK = address(0xB0B);
-    // An output whose 1.5% fee is odd (15e15 + 3), so the split's rounding is observable.
+    // An output whose 1.5% fee is odd (15e15 + 3), so even the odd wei must accrue to the treasury.
     int128 internal constant ODD_FEE_OUT = 1e18 + 200;
 
     MockPoolManager internal manager;
@@ -59,9 +69,7 @@ contract SurplusFeeHookTest is HookTest {
     }
 
     function _unwithdrawn(address currency) internal view returns (uint256) {
-        return
-            (hook.teamOwed(currency) - hook.teamPaid(currency))
-                + (hook.buybackOwed(currency) - hook.buybackPaid(currency));
+        return hook.teamOwed(currency) - hook.teamPaid(currency);
     }
 
     function test_FeeConstantsMatchSpec() public view {
@@ -83,6 +91,7 @@ contract SurplusFeeHookTest is HookTest {
         assertEq(token1.balanceOf(address(hook)), fee, "fee taken in token1");
         assertEq(token0.balanceOf(address(hook)), 0, "nothing taken in token0");
         assertEq(hook.totalTaken(address(token1)), fee, "totalTaken token1");
+        assertEq(hook.teamOwed(address(token1)), fee, "full exact-in fee to treasury");
     }
 
     function test_ExactInOneForZeroChargesToken0() public {
@@ -93,6 +102,7 @@ contract SurplusFeeHookTest is HookTest {
         assertEq(token0.balanceOf(address(hook)), fee, "fee taken in token0");
         assertEq(token1.balanceOf(address(hook)), 0, "nothing taken in token1");
         assertEq(hook.totalTaken(address(token0)), fee, "totalTaken token0");
+        assertEq(hook.teamOwed(address(token0)), fee, "full exact-in fee to treasury");
     }
 
     function test_H1_ExactOutZeroForOneChargesTheInputToken0() public {
@@ -103,6 +113,7 @@ contract SurplusFeeHookTest is HookTest {
         assertEq(token0.balanceOf(address(hook)), fee, "fee taken in token0, the input");
         assertEq(token1.balanceOf(address(hook)), 0, "nothing taken in token1, the output");
         assertEq(hook.totalTaken(address(token0)), fee, "totalTaken token0");
+        assertEq(hook.teamOwed(address(token0)), fee, "full exact-out fee to treasury");
     }
 
     function test_H1_ExactOutOneForZeroChargesTheInputToken1() public {
@@ -113,15 +124,56 @@ contract SurplusFeeHookTest is HookTest {
         assertEq(token1.balanceOf(address(hook)), fee, "fee taken in token1, the input");
         assertEq(token0.balanceOf(address(hook)), 0, "nothing taken in token0, the output");
         assertEq(hook.totalTaken(address(token1)), fee, "totalTaken token1");
+        assertEq(hook.teamOwed(address(token1)), fee, "full exact-out fee to treasury");
     }
 
-    function test_FeeSplitsIntoHalvesWithTheOddWeiToBuyback() public {
+    function test_FullFeeIncludingOddWeiAccruesToTreasury() public {
         _afterSwap(true, -1e18, -1e18, ODD_FEE_OUT);
         uint256 fee = _abs(ODD_FEE_OUT) * FEE_PIPS / PIPS;
         assertEq(fee % 2, 1, "fixture fee is odd");
-        assertEq(hook.teamOwed(address(token1)), fee / 2, "team half");
-        assertEq(hook.buybackOwed(address(token1)), fee - fee / 2, "buyback half keeps the odd wei");
-        assertEq(hook.teamOwed(address(token1)) + hook.buybackOwed(address(token1)), fee, "halves sum to the fee");
+        assertEq(hook.teamOwed(address(token1)), fee, "full fee including odd wei to treasury");
+        assertEq(hook.totalTaken(address(token1)), fee, "all taken fees owed to treasury");
+    }
+
+    function test_FeeEventContainsOnlyCurrencyBasisAndFullTake() public {
+        VmFeeLogs logs = VmFeeLogs(address(vm));
+        logs.recordLogs();
+        _afterSwap(true, -1e18, -1e18, ODD_FEE_OUT);
+        VmFeeLogs.Log[] memory entries = logs.getRecordedLogs();
+        uint256 seen;
+        for (uint256 i; i < entries.length; ++i) {
+            if (entries[i].emitter != address(hook)) continue;
+            ++seen;
+            assertEq(entries[i].topics.length, 2, "event has only signature and currency topics");
+            assertEq(entries[i].topics[0], keccak256("FeeTaken(address,uint256,uint256)"), "single-bucket fee event");
+            assertEq(entries[i].topics[1], bytes32(uint256(uint160(address(token1)))), "fee currency");
+            uint256 basis = _abs(ODD_FEE_OUT);
+            assertEq(entries[i].data, abi.encode(basis, basis * FEE_PIPS / PIPS), "basis and full take only");
+        }
+        assertEq(seen, 1, "one fee event");
+    }
+
+    function test_RemovedBuybackGettersAndHalfConstantRevert() public view {
+        bytes[3] memory calls = [
+            abi.encodeWithSignature("buybackOwed(address)", address(token1)),
+            abi.encodeWithSignature("buybackPaid(address)", address(token1)),
+            abi.encodeWithSignature("HALF_PIPS()")
+        ];
+        for (uint256 i; i < calls.length; ++i) {
+            (bool ok, bytes memory ret) = address(hook).staticcall(calls[i]);
+            assertFalse(ok, "removed legacy getter is callable");
+            assertEq(ret.length, 0, "no legacy getter implementation");
+        }
+    }
+
+    function test_RemovedWithdrawBuybackRevertsEvenForTreasury() public {
+        _afterSwap(true, -1e18, -1e18, ODD_FEE_OUT);
+        vm.prank(TREASURY);
+        (bool ok, bytes memory ret) = address(hook)
+            .call(abi.encodeWithSignature("withdrawBuyback(address,address,uint256)", address(token1), TEAM_SINK, 0));
+        assertFalse(ok, "removed buyback withdrawal is callable");
+        assertEq(ret.length, 0, "no legacy withdrawal implementation");
+        assertEq(token1.balanceOf(TEAM_SINK), 0, "no fee left through legacy API");
     }
 
     function test_WithdrawalsAreTreasuryOnly() public {
@@ -131,14 +183,11 @@ contract SurplusFeeHookTest is HookTest {
             vm.prank(outsiders[i]);
             vm.expectRevert(abi.encodeWithSelector(SurplusFeeHook.NotTreasury.selector, outsiders[i]));
             hook.withdrawTeam(address(token1), outsiders[i], 1);
-            vm.prank(outsiders[i]);
-            vm.expectRevert(abi.encodeWithSelector(SurplusFeeHook.NotTreasury.selector, outsiders[i]));
-            hook.withdrawBuyback(address(token1), outsiders[i], 1);
         }
         assertEq(token1.balanceOf(address(hook)), 2e18 * FEE_PIPS / PIPS, "nothing left the hook");
     }
 
-    function test_OwedAndPaidAreTrackedPerCurrencyAndHalf() public {
+    function test_OwedAndPaidAreTrackedPerCurrencyWithPartialWithdrawal() public {
         _afterSwap(true, -1e18, -1e18, ODD_FEE_OUT);
         _afterSwap(false, -3e18, 5e17, -3e18);
         uint256 fee1 = _abs(ODD_FEE_OUT) * FEE_PIPS / PIPS;
@@ -146,33 +195,34 @@ contract SurplusFeeHookTest is HookTest {
 
         vm.startPrank(TREASURY);
         hook.withdrawTeam(address(token1), TEAM_SINK, 5e15);
-        hook.withdrawBuyback(address(token1), BUYBACK_SINK, fee1 - fee1 / 2);
-        hook.withdrawTeam(address(token0), TEAM_SINK, fee0 / 2);
+        hook.withdrawTeam(address(token0), TEAM_SINK, fee0);
         vm.stopPrank();
 
         assertEq(hook.teamPaid(address(token1)), 5e15, "team paid token1");
-        assertEq(hook.buybackPaid(address(token1)), fee1 - fee1 / 2, "buyback paid token1");
-        assertEq(hook.teamPaid(address(token0)), fee0 / 2, "team paid token0");
-        assertEq(hook.buybackPaid(address(token0)), 0, "buyback token0 untouched");
+        assertEq(hook.teamPaid(address(token0)), fee0, "full token0 fee paid");
+        assertEq(hook.teamOwed(address(token1)), fee1, "lifetime token1 fees");
+        assertEq(hook.teamOwed(address(token0)), fee0, "lifetime token0 fees");
         assertEq(token1.balanceOf(TEAM_SINK), 5e15, "team sink token1");
-        assertEq(token1.balanceOf(BUYBACK_SINK), fee1 - fee1 / 2, "buyback sink token1");
-        assertEq(token0.balanceOf(TEAM_SINK), fee0 / 2, "team sink token0");
+        assertEq(token0.balanceOf(TEAM_SINK), fee0, "treasury sink token0");
 
-        // One half's balance can never pay the other half's claim, nor more than its own remainder.
-        uint256 teamLeft1 = fee1 / 2 - 5e15;
+        // Each currency is limited to its own unpaid full-fee balance.
+        uint256 teamLeft1 = fee1 - 5e15;
         vm.prank(TREASURY);
         vm.expectRevert(
             abi.encodeWithSelector(SurplusFeeHook.InsufficientOwed.selector, address(token1), teamLeft1, teamLeft1 + 1)
         );
         hook.withdrawTeam(address(token1), TEAM_SINK, teamLeft1 + 1);
         vm.prank(TREASURY);
-        vm.expectRevert(abi.encodeWithSelector(SurplusFeeHook.InsufficientOwed.selector, address(token1), 0, 1));
-        hook.withdrawBuyback(address(token1), BUYBACK_SINK, 1);
+        vm.expectRevert(abi.encodeWithSelector(SurplusFeeHook.InsufficientOwed.selector, address(token0), 0, 1));
+        hook.withdrawTeam(address(token0), TEAM_SINK, 1);
 
-        // Balance conservation: the hook holds exactly the unwithdrawn owed amounts.
         assertEq(token1.balanceOf(address(hook)), _unwithdrawn(address(token1)), "token1 conserved");
         assertEq(token0.balanceOf(address(hook)), _unwithdrawn(address(token0)), "token0 conserved");
-        assertEq(_unwithdrawn(address(token1)), teamLeft1, "only the team remainder is left in token1");
+        assertEq(_unwithdrawn(address(token1)), teamLeft1, "the full treasury remainder is left in token1");
+        vm.prank(TREASURY);
+        hook.withdrawTeam(address(token1), TEAM_SINK, teamLeft1);
+        assertEq(hook.teamPaid(address(token1)), fee1, "full token1 fee eventually paid");
+        assertEq(token1.balanceOf(address(hook)), 0, "token1 fully withdrawn");
     }
 
     /// H2: take() needs no sync(), and a currency left synced breaks any native settle later in the same unlock.
@@ -183,8 +233,7 @@ contract SurplusFeeHookTest is HookTest {
         assertEq(manager.syncCalls(), 0, "no currency left synced");
     }
 
-    /// H4: a call to an address without code succeeds and returns nothing, so a withdrawal in native ETH
-    /// (address(0)) or any other code-less currency would be booked as paid while nothing moved.
+    /// H4: a successful call to a no-code currency must not count as a payment.
     function test_H4_WithdrawalInACurrencyWithoutCodeReverts() public {
         address[2] memory codeless = [address(0), address(0xDEAD0001)];
         vm.deal(address(hook), 1 ether);
@@ -193,11 +242,8 @@ contract SurplusFeeHookTest is HookTest {
             vm.startPrank(TREASURY);
             vm.expectRevert(SurplusFeeHook.TransferFailed.selector);
             hook.withdrawTeam(codeless[i], TEAM_SINK, 1 ether);
-            vm.expectRevert(SurplusFeeHook.TransferFailed.selector);
-            hook.withdrawBuyback(codeless[i], BUYBACK_SINK, 1 ether);
             vm.stopPrank();
-            assertEq(hook.teamPaid(codeless[i]), 0, "team half not booked as paid");
-            assertEq(hook.buybackPaid(codeless[i]), 0, "buyback half not booked as paid");
+            assertEq(hook.teamPaid(codeless[i]), 0, "treasury fees not booked as paid");
         }
     }
 
@@ -207,31 +253,30 @@ contract SurplusFeeHookTest is HookTest {
         vm.startPrank(TREASURY);
         vm.expectRevert(SurplusFeeHook.ZeroAddress.selector);
         hook.withdrawTeam(address(token1), address(0), 1);
-        vm.expectRevert(SurplusFeeHook.ZeroAddress.selector);
-        hook.withdrawBuyback(address(token1), address(0), 1);
         vm.stopPrank();
         assertEq(token1.balanceOf(address(0)), 0, "nothing burned");
-        assertEq(hook.teamPaid(address(token1)) + hook.buybackPaid(address(token1)), 0, "nothing booked as paid");
+        assertEq(hook.teamPaid(address(token1)), 0, "nothing booked as paid");
     }
 
     function test_WithdrawalRevertsWhenTheTokenFailsAndBooksNothing() public {
         FlakyToken flaky = new FlakyToken();
         flaky.mint(address(manager), 1e30);
         _accrueIn(address(flaky), 2e18);
+        uint256 fee = 2e18 * FEE_PIPS / PIPS;
         FlakyToken.Mode[2] memory failing = [FlakyToken.Mode.Revert, FlakyToken.Mode.ReturnFalse];
         for (uint256 i; i < failing.length; ++i) {
             flaky.setMode(failing[i]);
             vm.prank(TREASURY);
             vm.expectRevert(SurplusFeeHook.TransferFailed.selector);
-            hook.withdrawTeam(address(flaky), TEAM_SINK, 1);
+            hook.withdrawTeam(address(flaky), TEAM_SINK, fee);
         }
         assertEq(hook.teamPaid(address(flaky)), 0, "nothing booked as paid");
 
         flaky.setMode(FlakyToken.Mode.ReturnNothing);
         vm.prank(TREASURY);
-        hook.withdrawTeam(address(flaky), TEAM_SINK, 1);
-        assertEq(flaky.balanceOf(TEAM_SINK), 1, "a token that returns no data still pays");
-        assertEq(hook.teamPaid(address(flaky)), 1, "and is booked");
+        hook.withdrawTeam(address(flaky), TEAM_SINK, fee);
+        assertEq(flaky.balanceOf(TEAM_SINK), fee, "a token that returns no data still pays the full fee");
+        assertEq(hook.teamPaid(address(flaky)), fee, "and is booked");
     }
 
     function test_RejectsNativeEth() public {
@@ -240,8 +285,8 @@ contract SurplusFeeHookTest is HookTest {
         assertFalse(ok, "the hook accepts no native ETH");
     }
 
-    /// Every swap shape pays exactly floor(|unspecified amount| * 1.5%) in the unspecified currency, split into
-    /// halves that sum to it, and only through take().
+    /// Every swap shape pays floor(|unspecified amount| * 1.5%) in the unspecified currency,
+    /// fully owed to the treasury, and only through take().
     function testFuzz_ChargesExactlyTheFeeOnTheUnspecifiedCurrency(
         bool zeroForOne,
         bool exactIn,
@@ -254,7 +299,6 @@ contract SurplusFeeHookTest is HookTest {
         (int128 in_, int128 out_) = (-_i128(amountIn), _i128(amountOut));
         (int128 amount0, int128 amount1) = zeroForOne ? (in_, out_) : (out_, in_);
         int256 amountSpecified = exactIn ? -_int(amountIn) : _int(amountOut);
-        // Exact-in leaves the output unspecified, exact-out the input.
         uint256 basis = exactIn ? amountOut : amountIn;
         bool feeIn0 = exactIn != zeroForOne;
         (MockERC20 feeToken, MockERC20 otherToken) = feeIn0 ? (token0, token1) : (token1, token0);
@@ -266,8 +310,8 @@ contract SurplusFeeHookTest is HookTest {
         assertEq(feeToken.balanceOf(address(hook)), fee, "fee taken in the unspecified currency");
         assertEq(otherToken.balanceOf(address(hook)), 0, "nothing taken in the specified currency");
         assertEq(hook.totalTaken(address(feeToken)), fee, "totalTaken");
-        assertEq(hook.teamOwed(address(feeToken)), fee / 2, "team half");
-        assertEq(hook.buybackOwed(address(feeToken)), fee - fee / 2, "buyback half");
+        assertEq(hook.teamOwed(address(feeToken)), fee, "full fee to treasury");
+        assertEq(hook.teamOwed(address(otherToken)), 0, "no fees owed in the specified currency");
         assertEq(manager.takeCalls(), fee == 0 ? 0 : 1, "one take per charged swap");
         assertEq(manager.syncCalls(), 0, "never syncs");
     }
@@ -289,12 +333,11 @@ contract SurplusFeeHookTest is HookTest {
         hook.afterSwap(SWAPPER, k, SwapParams(false, -1e18, 0), _delta(out, -1e18), "");
     }
 
-    /// @dev Books `amount` of `currency` to both fee halves without a swap, for currencies no pool can pay in.
-    ///      teamOwed and buybackOwed are the hook's first two storage slots: every other field is an immutable.
+    /// @dev Books treasury fees without a swap, for currencies no pool can pay in.
+    ///      teamOwed is slot 0; do not write slot 1 (teamPaid).
     function _creditOwed(address currency, uint256 amount) internal {
         vm.store(address(hook), keccak256(abi.encode(currency, uint256(0))), bytes32(amount));
-        vm.store(address(hook), keccak256(abi.encode(currency, uint256(1))), bytes32(amount));
         assertEq(hook.teamOwed(currency), amount, "teamOwed slot");
-        assertEq(hook.buybackOwed(currency), amount, "buybackOwed slot");
+        assertEq(hook.teamPaid(currency), 0, "crediting owed must not mark fees paid");
     }
 }

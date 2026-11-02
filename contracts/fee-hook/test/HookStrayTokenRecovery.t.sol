@@ -10,7 +10,7 @@ import {MockERC20} from "./MockERC20.sol";
 /**
  * @dev Spec §3.5 oracle review of the fee-hook diff, round 2 finding 2 (triage:
  *      contracts/migration-launch/kit/evidence/review/fee-hook-oracle.md). FAILS on b62393184: tokens sent to the
- *      hook outside afterSwap have no way out, because both withdrawals stop at owed − paid. It targets the
+ *      hook outside afterSwap have no way out, because fee withdrawals stop at owed − paid. It targets the
  *      recovery ABI of 1ed281150, `recoverExcess(currency, to)`, spelled from its signature so this file compiles
  *      before the fix. It complements test/HookOracleReview.t.sol from that commit with the cases that decide
  *      what "the balance above the unpaid fees" is: a currency the hook never charged, fees already partly
@@ -49,13 +49,13 @@ contract HookStrayTokenRecoveryTest is HookTest {
         PoolKey memory key = PoolKey(address(token0), address(token1), LP_FEE, TICK_SPACING, address(hook));
         vm.prank(address(manager));
         hook.afterSwap(SWAPPER, key, SwapParams(true, -1e18, 0), _delta(-1e18, 2e18), "");
-        uint256 team = hook.teamOwed(address(token1));
-        uint256 buyback = hook.buybackOwed(address(token1));
-        assertEq(team + buyback, 3e16, "the fee accrued");
+        uint256 fee = hook.teamOwed(address(token1));
+        assertEq(fee, 3e16, "the full fee accrued to the treasury");
+        uint256 paidFirst = fee / 3;
 
-        // The Safe withdraws the team half first: `paid` is now non-zero, so owed alone overstates what is unpaid.
+        // A partial withdrawal makes `paid` non-zero, so owed alone overstates what is unpaid.
         vm.prank(TREASURY);
-        hook.withdrawTeam(address(token1), SINK, team);
+        hook.withdrawTeam(address(token1), SINK, paidFirst);
 
         // Plain transfers: in the fee currency, and in a currency the hook never charged.
         _strayTransfer(token1);
@@ -64,14 +64,17 @@ contract HookStrayTokenRecoveryTest is HookTest {
         assertFalse(_recover(STRANGER, address(token1)), "a stranger recovered tokens");
         assertTrue(_recover(TREASURY, address(token1)), "stray token1 is stranded: nothing returns it");
         assertTrue(_recover(TREASURY, address(token0)), "stray token0 is stranded: nothing returns it");
-        assertEq(token1.balanceOf(SINK), team + STRAY, "exactly the stray token1 came back");
+        assertEq(token1.balanceOf(SINK), paidFirst + STRAY, "exactly the stray token1 came back");
         assertEq(token0.balanceOf(SINK), STRAY, "exactly the stray token0 came back");
-        assertEq(token1.balanceOf(address(hook)), buyback, "the unpaid buyback half stayed in the hook");
+        assertEq(token1.balanceOf(address(hook)), fee - paidFirst, "all unpaid treasury fees stayed in the hook");
+        assertEq(hook.teamOwed(address(token1)), fee, "recovery preserves accrued fees");
+        assertEq(hook.teamPaid(address(token1)), paidFirst, "recovery preserves paid fees");
         assertFalse(_recover(TREASURY, address(token1)), "a second recovery reached into the unpaid fees");
 
-        // The unpaid half is still fully withdrawable, and nothing is left behind.
+        // All unpaid treasury fees are still withdrawable, and nothing is left behind.
         vm.prank(TREASURY);
-        hook.withdrawBuyback(address(token1), SINK, buyback);
+        hook.withdrawTeam(address(token1), SINK, fee - paidFirst);
+        assertEq(hook.teamPaid(address(token1)), fee, "all fees paid");
         assertEq(token1.balanceOf(address(hook)), 0, "token1 left in the hook");
         assertEq(token0.balanceOf(address(hook)), 0, "token0 left in the hook");
     }

@@ -53,7 +53,6 @@ abstract contract ForkHarness is HookTest {
     address internal constant INITIALIZER = address(0x1417); // stands in for the launch helper
     address internal constant STRANGER = address(0xBAD);
     address internal constant TEAM_SINK = address(0x7EA7);
-    address internal constant BUYBACK_SINK = address(0xB0B);
 
     MockERC20 internal v2;
     Actor internal actor;

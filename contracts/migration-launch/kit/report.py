@@ -173,7 +173,7 @@ def main() -> None:
     w(f"- exact-out buy (→ 10M v2): {tokens(result['feeExactOutBuy'], 6)} WETH")
     w(f"- exact-out sell (→ 0.2 WETH): {tokens(result['feeExactOutSell'], 2)} v2")
     w("")
-    w("The Safe then withdrew both halves (team and buyback) of both currencies, leaving the hook empty. The")
+    w("The Safe then withdrew the full fees in both currencies from the single treasury bucket, leaving the hook empty. The")
     w("contracts/fee-hook fork suite measures a small trade's all-in cost at 0.3001% (LP fee + price impact) +")
     w("1.4999% (hook): about 1.8%.")
     w("")
